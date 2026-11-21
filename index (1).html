@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MapsHUD</title>
+<style>
+:root{--bg:#fff;--fg:#111;--card:#f1f3f5;--ac:#0b6bcb}
+@media(prefers-color-scheme:dark){:root{--bg:#101418;--fg:#eee;--card:#1b222a;--ac:#2f80d8}}
+body{margin:auto;padding:16px;background:var(--bg);color:var(--fg);font:16px system-ui,sans-serif;max-width:520px}
+h1{font-size:20px}
+button,input{font:inherit;width:100%;box-sizing:border-box;padding:12px;margin:6px 0;border-radius:10px;border:1px solid #8886;background:var(--card);color:var(--fg)}
+button{background:var(--ac);color:#fff;border:0;font-weight:600}
+button.s{background:#c0392b}
+#log{background:var(--card);border-radius:10px;padding:12px;font-size:14px;min-height:60px;white-space:pre-wrap;margin-top:8px}
+small{opacity:.7}
+</style>
+</head>
+<body>
+<h1>MapsHUD</h1>
+<button id="bc">1. Hubungkan ke MapsHUD (Bluetooth)</button>
+<input id="dest" placeholder="Tujuan: nama tempat, link Maps, atau lat,lon">
+<button id="bs">2. Mulai navigasi</button>
+<button id="bx" class="s">Stop</button>
+<div id="log">Siap.</div>
+<p><small>Pakai Chrome di Android. Biarkan halaman ini terbuka dan layar menyala selama navigasi.</small></p>
+<script>
+const SVC="6e400001-b5a3-f393-e0a9-e50e24dcca9e", CHR="6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+const $=id=>document.getElementById(id), log=s=>$("log").textContent=s;
+const rad=d=>d*Math.PI/180;
+const dist=(a,b,c,d)=>Math.hypot((d-b)*111320*Math.cos(rad(a)),(c-a)*111320);
+let chr=null,route=[],dest=null,watchId=null,lock=null,fetching=false,lastFetch=0,sending=false;
+
+$("bc").onclick=async()=>{
+  if(!navigator.bluetooth){log("Browser ini tidak mendukung Web Bluetooth. Pakai Chrome di Android.");return;}
+  try{
+    const dev=await navigator.bluetooth.requestDevice({filters:[{services:[SVC]},{name:"MapsHUD"}],optionalServices:[SVC]});
+    dev.addEventListener("gattserverdisconnected",()=>{chr=null;log("Bluetooth terputus");});
+    const srv=await dev.gatt.connect();
+    chr=await (await srv.getPrimaryService(SVC)).getCharacteristic(CHR);
+    log("Terhubung ke MapsHUD");
+  }catch(e){log("Gagal Bluetooth: "+e.message);}
+};
+
+function coords(s){
+  try{s=decodeURIComponent(s)}catch(e){}
+  for(const p of [/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/,/@(-?\d+\.\d+),(-?\d+\.\d+)/,
+    /(?:q|query|ll|destination)=(-?\d+\.\d+),\s*(-?\d+\.\d+)/,/(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)/]){
+    const m=s.match(p); if(m) return [+m[1],+m[2]];
+  }
+  return null;
+}
+async function resolveDest(t){
+  const c=coords(t); if(c) return c;
+  if(/^https?:\/\//.test(t)) throw new Error("Link pendek tidak bisa dibaca di sini. Buka link itu di browser lalu salin alamat lengkapnya, atau ketik nama tempat.");
+  const j=await (await fetch("https://nominatim.openstreetmap.org/search?format=json&limit=1&q="+encodeURIComponent(t))).json();
+  if(!j.length) throw new Error("Tempat tidak ditemukan");
+  log("Tujuan: "+j[0].display_name); return [+j[0].lat,+j[0].lon];
+}
+
+$("bs").onclick=async()=>{
+  const t=$("dest").value.trim(); if(!t){log("Isi tujuan dulu");return;}
+  try{dest=await resolveDest(t);}catch(e){log(e.message);return;}
+  route=[];
+  try{lock=await navigator.wakeLock.request("screen");}catch(e){}
+  if(watchId!==null) navigator.geolocation.clearWatch(watchId);
+  watchId=navigator.geolocation.watchPosition(onPos,e=>log("GPS: "+e.message),{enableHighAccuracy:true,maximumAge:0});
+  log("Menunggu GPS...");
+};
+$("bx").onclick=()=>{
+  if(watchId!==null) navigator.geolocation.clearWatch(watchId);
+  watchId=null;dest=null;route=[];
+  try{lock.release();}catch(e){}
+  log("Dihentikan");
+};
+
+async function onPos(p){
+  if(!dest) return;
+  if(route.length<2){await fetchRoute(p.coords);return;}
+  push(p.coords);
+}
+async function fetchRoute(c){
+  if(fetching||Date.now()-lastFetch<15000) return;
+  fetching=true;lastFetch=Date.now();
+  try{
+    const r=await fetch(`https://router.project-osrm.org/route/v1/driving/${c.longitude},${c.latitude};${dest[1]},${dest[0]}?overview=full&geometries=geojson`);
+    const j=await r.json();
+    route=j.routes[0].geometry.coordinates.map(q=>[q[1],q[0]]);
+    log("Rute dimuat: "+route.length+" titik");
+  }catch(e){log("Gagal ambil rute: "+e.message);}
+  fetching=false;
+}
+function push(c){
+  const la=c.latitude,lo=c.longitude;
+  let bi=0,bd=1e12;
+  route.forEach((q,i)=>{const d=dist(la,lo,q[0],q[1]);if(d<bd){bd=d;bi=i;}});
+  if(bd>80){route=[];return;}   // keluar rute -> hitung ulang
+  let rem=0;
+  for(let i=bi;i<route.length-1;i++) rem+=dist(route[i][0],route[i][1],route[i+1][0],route[i+1][1]);
+  const brg=(c.heading!=null&&!isNaN(c.heading))?Math.round(c.heading):0;
+  let s=`${brg},${Math.round((c.speed||0)*3.6)},${Math.round(rem)}|`;
+  const k=Math.cos(rad(la));let ll=la,lg=lo,cum=0,n=0;
+  for(let i=bi;i<route.length;i++){
+    const q=route[i],seg=dist(ll,lg,q[0],q[1]);
+    if(seg<15&&i!==route.length-1) continue;
+    cum+=seg;
+    s+=`${Math.round((q[1]-lo)*111320*k)},${Math.round((q[0]-la)*111320)};`;
+    ll=q[0];lg=q[1];
+    if(++n>=20||cum>500) break;
+  }
+  write(s);
+  log(`Mengirim... sisa ${Math.round(rem)} m`+(chr?"":"\n(Bluetooth belum terhubung)"));
+}
+async function write(s){
+  if(!chr||sending) return;
+  sending=true;
+  try{await chr.writeValueWithoutResponse(new TextEncoder().encode(s));}catch(e){}
+  sending=false;
+}
+</script>
+</body>
+</html>
